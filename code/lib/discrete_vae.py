@@ -2,9 +2,7 @@ import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 from einops import rearrange
-from math import log2, sqrt
-
-
+from math import sqrt
 
 def exists(val):
     return val is not None
@@ -23,28 +21,25 @@ def default(val, d):
 
 def gumbel_noise(t):
     noise = torch.zeros_like(t).uniform_(0, 1)
-    return -log(-log(noise))
+    return -torch.log(-torch.log(noise))
 
-def gumbel_sample(t, temperature = 1., dim = -1):
-    return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
-
-def log(t, eps = 1e-20):
-    return torch.log(t.clamp(min = eps))
+def gumbel_sample(t, temperature=1., dim=-1):
+    return ((t / temperature) + gumbel_noise(t)).argmax(dim=dim)
 
 class ResBlock(nn.Module):
-    def __init__(self, chan):
+    def __init__(self, channels):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(chan, chan, 3, padding = 1),
+            nn.Conv2d(channels, channels, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(chan, chan, 3, padding = 1),
+            nn.Conv2d(channels, channels, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(chan, chan, 1)
+            nn.Conv2d(channels, channels, 1)
         )
 
     def forward(self, x):
         return self.net(x) + x
-    
+
 class DiscreteVAE(nn.Module):
     def __init__(
         self,
@@ -63,49 +58,38 @@ class DiscreteVAE(nn.Module):
         normalization=((0.5,) * 3, (0.5,) * 3)
     ):
         super().__init__()
-        # assert log2(image_size).is_integer(), 'image size must be a power of 2'
-        assert num_layers >= 1, 'number of layers must be greater than or equal to 1'
+        assert num_layers >= 1, 'Number of layers must be >= 1'
         has_resblocks = num_resnet_blocks > 0
 
         self.channels = channels
         self.image_size = image_size
         self.num_tokens = num_tokens
-        self.num_layers = num_layers
         self.temperature = temperature
         self.straight_through = straight_through
         self.reinmax = reinmax
 
         self.codebook = nn.Embedding(num_tokens, codebook_dim)
 
-        hdim = hidden_dim
-
-        enc_chans = [hidden_dim] * num_layers
-        dec_chans = list(reversed(enc_chans))
-
-        enc_chans = [channels, *enc_chans]
-        dec_init_chan = codebook_dim if not has_resblocks else dec_chans[0]
-        dec_chans = [dec_init_chan, *dec_chans]
-
-        enc_chans_io, dec_chans_io = map(lambda t: list(zip(t[:-1], t[1:])), (enc_chans, dec_chans))
+        enc_channels = [channels, *[hidden_dim] * num_layers]
+        dec_channels = [codebook_dim if not has_resblocks else hidden_dim, *reversed(enc_channels[1:])]
 
         enc_layers = []
         dec_layers = []
 
-        for (enc_in, enc_out), (dec_in, dec_out) in zip(enc_chans_io, dec_chans_io):
+        for enc_in, enc_out in zip(enc_channels[:-1], enc_channels[1:]):
             enc_layers.append(nn.Sequential(nn.Conv2d(enc_in, enc_out, 4, stride=2, padding=1), nn.ReLU()))
+        
+        for dec_in, dec_out in zip(dec_channels[:-1], dec_channels[1:]):
             dec_layers.append(nn.Sequential(nn.ConvTranspose2d(dec_in, dec_out, 4, stride=2, padding=1), nn.ReLU()))
 
-        for _ in range(num_resnet_blocks):
-            dec_layers.insert(0, ResBlock(dec_chans[1]))
-            enc_layers.append(ResBlock(enc_chans[-1]))
+        if has_resblocks:
+            for _ in range(num_resnet_blocks):
+                enc_layers.append(ResBlock(enc_channels[-1]))
+                dec_layers.insert(0, ResBlock(hidden_dim))
+            dec_layers.insert(0, nn.Conv2d(codebook_dim, hidden_dim, 1))
 
-        if num_resnet_blocks > 0:
-            dec_layers.insert(0, nn.Conv2d(codebook_dim, dec_chans[1], 1))
-
-        enc_layers.append(nn.Conv2d(enc_chans[-1], num_tokens, 1))
-        dec_layers.append(nn.Conv2d(dec_chans[-1], channels, 1))
-
-        # dec_layers.append(nn.Upsample(size=(256, 256), mode='bilinear', align_corners=False))
+        enc_layers.append(nn.Conv2d(enc_channels[-1], num_tokens, 1))
+        dec_layers.append(nn.Conv2d(dec_channels[-1], channels, 1))
 
         self.encoder = nn.Sequential(*enc_layers)
         self.decoder = nn.Sequential(*dec_layers)
@@ -118,76 +102,53 @@ class DiscreteVAE(nn.Module):
     def norm(self, images):
         if not exists(self.normalization):
             return images
-
         means, stds = map(lambda t: torch.as_tensor(t).to(images), self.normalization)
         means, stds = map(lambda t: rearrange(t, 'c -> () c () ()'), (means, stds))
-        images = images.clone()
-        images.sub_(means).div_(stds)
-        return images
+        return (images.clone().sub_(means).div_(stds))
 
     @torch.no_grad()
     @eval_decorator
     def get_codebook_indices(self, images):
         logits = self(images, return_logits=True)
-        codebook_indices = logits.argmax(dim=1).flatten(1)
-        return codebook_indices
+        return logits.argmax(dim=1).flatten(1)
 
     def denormalize(self, images):
-        device = torch.device('cuda:0')
-        means = torch.tensor([0.5, 0.5, 0.5], device=device).reshape(1, 3, 1, 1)
-        stds = torch.tensor([0.5, 0.5, 0.5], device=device).reshape(1, 3, 1, 1)
+        device = images.device
+        means, stds = map(lambda t: torch.tensor(t, device=device).reshape(1, 3, 1, 1), ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]))
         return images * stds + means
 
     def decode(self, img_seq):
-        image_embeds = self.codebook(img_seq)
-        b, n, d = image_embeds.shape
-        h = w = int(sqrt(n))
-
-        image_embeds = rearrange(image_embeds, 'b (h w) d -> b d h w', h=h, w=w)
-        images = self.decoder(image_embeds)
-        return images
+        image_embeds = rearrange(self.codebook(img_seq), 'b (h w) d -> b d h w', h=int(sqrt(img_seq.shape[1])))
+        return self.decoder(image_embeds)
 
     def forward(self, img, return_loss=True, return_recons=True, return_logits=False, temp=None):
-        device, num_tokens, image_size, kl_div_loss_weight = img.device, self.num_tokens, self.image_size, self.kl_div_loss_weight
-        assert img.shape[-1] == image_size and img.shape[-2] == image_size, f'input must have the correct image size {image_size}'
-
         img = self.norm(img)
-
         logits = self.encoder(img)
 
         if return_logits:
-            return logits  # return logits for getting hard image indices for DALL-E training
+            return logits
 
         temp = default(temp, self.temperature)
-
         one_hot = F.gumbel_softmax(logits, tau=temp, dim=1, hard=self.straight_through)
-
+        
         if self.straight_through and self.reinmax:
             one_hot = one_hot.detach()
             pi_0 = logits.softmax(dim=1)
             pi_1 = (one_hot + (logits / temp).softmax(dim=1)) / 2
             pi_1 = ((log(pi_1) - logits).detach() + logits).softmax(dim=1)
-            pi_2 = 2 * pi_1 - 0.5 * pi_0
-            one_hot = pi_2 - pi_2.detach() + one_hot
+            one_hot = 2 * pi_1 - 0.5 * pi_0 - (2 * pi_1 - 0.5 * pi_0).detach() + one_hot
 
         sampled = einsum('b n h w, n d -> b d h w', one_hot, self.codebook.weight)
-        out = self.decoder(sampled)
-        out = self.denormalize(out)
-        # out = out * 255
+        out = self.denormalize(self.decoder(sampled))
+
         if not return_loss:
-            print("return vae out only!\n")
             return out
 
         recon_loss = self.loss_fn(img, out)
-
-        logits = rearrange(logits, 'b n h w -> b (h w) n')
-        log_qy = F.log_softmax(logits, dim=-1)
-        log_uniform = torch.log(torch.tensor([1. / num_tokens], device=device))
-        kl_div = F.kl_div(log_uniform, log_qy, None, None, 'batchmean', log_target=True)
-
-        loss = recon_loss + (kl_div * kl_div_loss_weight)
-
+        log_qy = F.log_softmax(rearrange(logits, 'b n h w -> b (h w) n'), dim=-1)
+        kl_div = F.kl_div(torch.log(torch.tensor([1. / self.num_tokens], device=img.device)), log_qy, None, None, 'batchmean', log_target=True)
+        
         if not return_recons:
-            return loss
+            return recon_loss + kl_div * self.kl_div_loss_weight
 
-        return loss, out
+        return recon_loss + kl_div * self.kl_div_loss_weight, out
